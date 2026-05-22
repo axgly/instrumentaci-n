@@ -1,0 +1,215 @@
+# Medicion continua de PWM
+import pyvisa
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import csv
+import os
+from datetime import datetime
+
+# =========================================================
+# CONFIGURACION
+# =========================================================
+CANAL        = "CH1"
+START        = 1
+STOP         = 2500
+INTERVALO_MS = 100   # milisegundos entre cada medicion
+MAX_PUNTOS   = 30     # cuantos puntos mostrar en la grafica historica
+# =========================================================
+
+# Historial para graficar
+historial_tiempo   = []
+historial_duty     = []
+historial_freq     = []
+t_inicio           = datetime.now()
+
+# CSV continuo
+timestamp_global = datetime.now().strftime("%Y%m%d_%H%M%S")
+CSV_FILE = f"pwm_continuo_{timestamp_global}.csv"
+
+def iniciar_csv():
+    with open(CSV_FILE, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Tiempo [s]", "Duty Cycle [%]", "Frecuencia [Hz]",
+                         "Periodo [ms]", "Ton [ms]", "Vmin [V]", "Vmax [V]"])
+    print("CSV:", os.path.abspath(CSV_FILE))
+
+def agregar_fila_csv(t_s, duty, freq, periodo, ton, vmin, vmax):
+    with open(CSV_FILE, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([f"{t_s:.2f}", f"{duty:.2f}", f"{freq:.2f}",
+                         f"{periodo*1e3:.3f}", f"{ton*1e3:.3f}",
+                         f"{vmin:.3f}", f"{vmax:.3f}"])
+
+def conectar_osciloscopio():
+    rm = pyvisa.ResourceManager()
+    resources = rm.list_resources()
+    print("Instrumentos encontrados:", resources)
+    if not resources:
+        raise RuntimeError("No se encontraron instrumentos VISA.")
+    scope = rm.open_resource(resources[0])
+    scope.timeout = 10000
+    print("Conectado a:", scope.query("*IDN?"))
+    return scope
+
+def configurar_canal(scope):
+    scope.write("HEADER OFF")
+    scope.write(f"DATA:SOURCE {CANAL}")
+    scope.write("DATA:ENC RPB")
+    scope.write("DATA:WIDTH 1")
+    scope.write(f"DATA:START {START}")
+    scope.write(f"DATA:STOP {STOP}")
+
+def adquirir_datos(scope):
+    ymult = scope.query_ascii_values("WFMPRE:YMULT?")[0]
+    yzero = scope.query_ascii_values("WFMPRE:YZERO?")[0]
+    yoff  = scope.query_ascii_values("WFMPRE:YOFF?")[0]
+    xincr = scope.query_ascii_values("WFMPRE:XINCR?")[0]
+
+    scope.write("CURVE?")
+    raw = scope.read_raw()
+
+    n_digits   = int(chr(raw[1]))
+    header_len = 2 + n_digits
+
+    data    = np.frombuffer(raw[header_len:-1], dtype=np.uint8)
+    voltage = (data.astype(float) - yoff) * ymult + yzero
+    time    = np.arange(len(voltage)) * xincr
+
+    return time, voltage
+
+def calcular_pwm(time, voltage):
+    vmax = np.max(voltage)
+    vmin = np.min(voltage)
+    threshold = (vmax + vmin) / 2
+
+    digital      = voltage > threshold
+    edges        = np.diff(digital.astype(int))
+    rising_edges  = np.where(edges == 1)[0]
+    falling_edges = np.where(edges == -1)[0]
+
+    if len(rising_edges) < 2:
+        return None
+
+    r1 = rising_edges[0]
+    r2 = rising_edges[1]
+
+    falling = falling_edges[
+        (falling_edges > r1) & (falling_edges < r2)
+    ]
+
+    if len(falling) == 0:
+        return None
+
+    f1 = falling[0]
+
+    periodo   = time[r2] - time[r1]
+    ton       = time[f1] - time[r1]
+    duty      = (ton / periodo) * 100
+    frecuencia = 1 / periodo
+
+    return {
+        "duty":      duty,
+        "frecuencia": frecuencia,
+        "periodo":   periodo,
+        "ton":       ton,
+        "vmin":      vmin,
+        "vmax":      vmax,
+    }
+
+# =========================================================
+# SETUP GRAFICA
+# =========================================================
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6))
+fig.suptitle("Medicion continua PWM", fontsize=13)
+
+linea_duty, = ax1.plot([], [], color="steelblue", linewidth=1.5)
+ax1.set_ylabel("Duty Cycle [%]")
+ax1.set_ylim(0, 105)
+ax1.grid(True)
+ax1.set_title("Duty Cycle")
+
+linea_freq, = ax2.plot([], [], color="tomato", linewidth=1.5)
+ax2.set_ylabel("Frecuencia [Hz]")
+ax2.set_xlabel("Tiempo transcurrido [s]")
+ax2.grid(True)
+ax2.set_title("Frecuencia")
+
+texto_duty = ax1.text(0.02, 0.90, "", transform=ax1.transAxes,
+                      fontsize=11, color="steelblue")
+texto_freq = ax2.text(0.02, 0.90, "", transform=ax2.transAxes,
+                      fontsize=11, color="tomato")
+
+plt.tight_layout()
+
+scope = conectar_osciloscopio()
+configurar_canal(scope)
+iniciar_csv()
+
+print("\nMidiendo PWM continuamente... Cierra la ventana para detener.\n")
+
+# =========================================================
+# FUNCION DE ACTUALIZACION (se llama cada INTERVALO_MS)
+# =========================================================
+def actualizar(frame):
+    try:
+        time, voltage = adquirir_datos(scope)
+        resultado = calcular_pwm(time, voltage)
+
+        if resultado is None:
+            print("Sin señal PWM valida en esta muestra.")
+            return linea_duty, linea_freq
+
+        t_s = (datetime.now() - t_inicio).total_seconds()
+
+        historial_tiempo.append(t_s)
+        historial_duty.append(resultado["duty"])
+        historial_freq.append(resultado["frecuencia"])
+
+        # Limitar ventana de puntos visibles
+        t_vis  = historial_tiempo[-MAX_PUNTOS:]
+        d_vis  = historial_duty[-MAX_PUNTOS:]
+        f_vis  = historial_freq[-MAX_PUNTOS:]
+
+        linea_duty.set_data(t_vis, d_vis)
+        linea_freq.set_data(t_vis, f_vis)
+
+        ax1.set_xlim(t_vis[0], max(t_vis[-1], t_vis[0] + 1))
+        ax2.set_xlim(t_vis[0], max(t_vis[-1], t_vis[0] + 1))
+        ax2.set_ylim(0, max(f_vis) * 1.2 + 1)
+
+        texto_duty.set_text(f"Duty: {resultado['duty']:.2f} %")
+        texto_freq.set_text(f"Freq: {resultado['frecuencia']:.2f} Hz")
+
+        agregar_fila_csv(t_s,
+                         resultado["duty"],
+                         resultado["frecuencia"],
+                         resultado["periodo"],
+                         resultado["ton"],
+                         resultado["vmin"],
+                         resultado["vmax"])
+
+        print(f"t={t_s:6.1f}s | Duty={resultado['duty']:6.2f}% | "
+              f"Freq={resultado['frecuencia']:8.2f} Hz | "
+              f"Ton={resultado['ton']*1e3:.3f} ms")
+
+    except Exception as e:
+        print("Error en medicion:", e)
+
+    return linea_duty, linea_freq
+
+# =========================================================
+# ANIMACION CONTINUA
+# =========================================================
+ani = animation.FuncAnimation(fig,
+                               actualizar,
+                               interval=INTERVALO_MS,
+                               blit=False,
+                               cache_frame_data=False)
+
+try:
+    plt.show()
+finally:
+    scope.close()
+    print("\nOsciloscopio desconectado.")
+    print("Datos guardados en:", os.path.abspath(CSV_FILE))
